@@ -11,18 +11,19 @@ import { MessageList } from '@/components/MessageList';
 import { ChatInput } from '@/components/ChatInput';
 import { useChatSocket } from '@/hooks/useChatSocket';
 import { CallModal } from '@/components/CallModal';
-
-interface CallContext {
-  conversationId: string;
-  peerUserId: string;
-  partnerName: string;
-  isCaller: boolean;
-}
+import { CallService, type CallSnapshot } from '@/services/call-service';
 
 interface PaginatedMessagesResponse {
   items: Message[];
   nextCursor?: string;
 }
+
+const createInitialCallSnapshot = (): CallSnapshot => ({
+  state: { status: 'idle', partnerName: null, isCaller: false, isMuted: false },
+  context: null,
+  localStream: null,
+  remoteStream: null
+});
 
 export default function ChatPage(): JSX.Element {
   const router = useRouter();
@@ -39,18 +40,14 @@ export default function ChatPage(): JSX.Element {
   const [presence, setPresence] = useState<PresenceState>({});
   const [typingState, setTypingState] = useState<Record<string, boolean>>({});
   const [loadingMessages, setLoadingMessages] = useState(false);
-  const [callUi, setCallUi] = useState<{ visible: boolean; isCaller: boolean; partnerName: string }>({
-    visible: false,
-    isCaller: true,
-    partnerName: ''
-  });
-  const [localStream, setLocalStream] = useState<MediaStream | null>(null);
-  const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
+  const [callSnapshot, setCallSnapshot] = useState<CallSnapshot>(() => createInitialCallSnapshot());
 
-  const callContextRef = useRef<CallContext | null>(null);
-  const peerRef = useRef<RTCPeerConnection | null>(null);
-  const localStreamRef = useRef<MediaStream | null>(null);
-  const remoteStreamRef = useRef<MediaStream | null>(null);
+  const callServiceRef = useRef<CallService | null>(null);
+  const conversationsRef = useRef<ConversationSummary[]>([]);
+
+  useEffect(() => {
+    conversationsRef.current = conversations;
+  }, [conversations]);
 
   useEffect(() => {
     bootstrap();
@@ -155,6 +152,44 @@ export default function ChatPage(): JSX.Element {
 
   useEffect(() => {
     if (!socket) {
+      if (callServiceRef.current) {
+        callServiceRef.current.dispose();
+        callServiceRef.current = null;
+      }
+      setCallSnapshot(createInitialCallSnapshot());
+      return;
+    }
+    if (!user) {
+      return;
+    }
+    const service = new CallService({
+      socket,
+      currentUserId: user.id,
+      resolvePeer: (conversationId: string, peerUserId: string) => {
+        const conversation = conversationsRef.current.find((item) => item.id === conversationId);
+        if (!conversation) {
+          return undefined;
+        }
+        const member = conversation.members.find((entry) => entry.userId === peerUserId);
+        if (!member) {
+          return undefined;
+        }
+        return { partnerName: member.user.username };
+      }
+    });
+    callServiceRef.current = service;
+    const unsubscribe = service.subscribe((snapshot) => {
+      setCallSnapshot(snapshot);
+    });
+    return () => {
+      unsubscribe();
+      service.dispose();
+      callServiceRef.current = null;
+    };
+  }, [socket, user]);
+
+  useEffect(() => {
+    if (!socket) {
       return;
     }
     const interval = window.setInterval(() => {
@@ -176,151 +211,16 @@ export default function ChatPage(): JSX.Element {
     };
   }, [socket, selectedConversationId]);
 
-  const ensurePeer = useCallback(async (): Promise<RTCPeerConnection> => {
-    if (peerRef.current) {
-      return peerRef.current;
-    }
-    const config: RTCConfiguration = {
-      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }]
-    };
-    const peer = new RTCPeerConnection(config);
-    peer.onicecandidate = (event) => {
-      if (event.candidate && callContextRef.current && socket) {
-        socket.emit('call:candidate', {
-          conversationId: callContextRef.current.conversationId,
-          toUserId: callContextRef.current.peerUserId,
-          candidate: event.candidate.toJSON()
-        });
-      }
-    };
-    peer.ontrack = (event) => {
-      const [stream] = event.streams;
-      remoteStreamRef.current = stream;
-      setRemoteStream(stream);
-    };
-    peerRef.current = peer;
-    return peer;
-  }, [socket]);
-
-  const startLocalStream = useCallback(async () => {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    localStreamRef.current = stream;
-    setLocalStream(stream);
-    return stream;
-  }, []);
-
-  const cleanupCall = useCallback(() => {
-    peerRef.current?.close();
-    peerRef.current = null;
-    callContextRef.current = null;
-    localStreamRef.current?.getTracks().forEach((track) => track.stop());
-    localStreamRef.current = null;
-    remoteStreamRef.current = null;
-    setLocalStream(null);
-    setRemoteStream(null);
-    setCallUi((prev) => ({ ...prev, visible: false }));
-  }, []);
-
-  const handleCallOffer = useCallback(
-    async (payload: { conversationId: string; fromUserId: string; sdp: string }) => {
-      if (!socket) {
-        return;
-      }
-      const conversation = conversations.find((item) => item.id === payload.conversationId);
-      if (!conversation) {
-        return;
-      }
-      const partnerName =
-        conversation.members.find((member) => member.userId === payload.fromUserId)?.user.username ??
-        'Unknown';
-      callContextRef.current = {
-        conversationId: payload.conversationId,
-        peerUserId: payload.fromUserId,
-        partnerName,
-        isCaller: false
-      };
-      const peer = await ensurePeer();
-      await peer.setRemoteDescription({ type: 'offer', sdp: payload.sdp });
-      const stream = await startLocalStream();
-      stream.getTracks().forEach((track) => peer.addTrack(track, stream));
-      const answer = await peer.createAnswer();
-      await peer.setLocalDescription(answer);
-      setCallUi({ visible: true, isCaller: false, partnerName });
-      socket.emit('call:answer', {
-        conversationId: payload.conversationId,
-        toUserId: payload.fromUserId,
-        sdp: answer.sdp
-      });
-    },
-    [socket, conversations, ensurePeer, startLocalStream]
-  );
-
-  const handleCallAnswer = useCallback(
-    async (payload: { conversationId: string; fromUserId: string; sdp: string }) => {
-      if (!peerRef.current) {
-        return;
-      }
-      await peerRef.current.setRemoteDescription({ type: 'answer', sdp: payload.sdp });
-    },
-    []
-  );
-
-  const handleCallCandidate = useCallback(
-    async (payload: { candidate: RTCIceCandidateInit }) => {
-      if (!peerRef.current || !payload.candidate) {
-        return;
-      }
-      await peerRef.current.addIceCandidate(new RTCIceCandidate(payload.candidate));
-    },
-    []
-  );
-
-  const handleCallHangup = useCallback(() => {
-    cleanupCall();
-  }, [cleanupCall]);
-
+  const incomingConversationId = callSnapshot.context?.conversationId ?? null;
   useEffect(() => {
-    if (!socket) {
-      return;
+    if (
+      callSnapshot.state.status === 'incoming' &&
+      incomingConversationId &&
+      incomingConversationId !== selectedConversationId
+    ) {
+      setSelectedConversationId(incomingConversationId);
     }
-    socket.on('call:offer', handleCallOffer);
-    socket.on('call:answer', handleCallAnswer);
-    socket.on('call:candidate', handleCallCandidate);
-    socket.on('call:hangup', handleCallHangup);
-    return () => {
-      socket.off('call:offer', handleCallOffer);
-      socket.off('call:answer', handleCallAnswer);
-      socket.off('call:candidate', handleCallCandidate);
-      socket.off('call:hangup', handleCallHangup);
-    };
-  }, [socket, handleCallOffer, handleCallAnswer, handleCallCandidate, handleCallHangup]);
-
-  const initiateCall = useCallback(
-    async (conversationId: string, peerUserId: string, partnerName: string) => {
-      if (!socket) {
-        return;
-      }
-      callContextRef.current = { conversationId, peerUserId, partnerName, isCaller: true };
-      const peer = await ensurePeer();
-      const stream = await startLocalStream();
-      stream.getTracks().forEach((track) => peer.addTrack(track, stream));
-      setCallUi({ visible: true, isCaller: true, partnerName });
-      const offer = await peer.createOffer();
-      await peer.setLocalDescription(offer);
-      socket.emit('call:offer', { conversationId, toUserId: peerUserId, sdp: offer.sdp });
-    },
-    [socket, ensurePeer, startLocalStream]
-  );
-
-  const hangupCall = useCallback(() => {
-    if (socket && callContextRef.current) {
-      socket.emit('call:hangup', {
-        conversationId: callContextRef.current.conversationId,
-        toUserId: callContextRef.current.peerUserId
-      });
-    }
-    cleanupCall();
-  }, [socket, cleanupCall]);
+  }, [callSnapshot.state.status, incomingConversationId, selectedConversationId]);
 
   const sendMessage = useCallback(
     async (type: MessageType, content: string, fileUrl?: string) => {
@@ -400,6 +300,56 @@ export default function ChatPage(): JSX.Element {
     return member?.user.username ?? null;
   }, [typingState, currentConversation, selectedConversationId]);
 
+  const handleStartCall = useCallback(() => {
+    const service = callServiceRef.current;
+    if (!service || !currentConversation || !user) {
+      return;
+    }
+    if (currentConversation.isGroup) {
+      return;
+    }
+    const peerMember = currentConversation.members.find((member) => member.userId !== user.id);
+    if (!peerMember) {
+      return;
+    }
+    void service.startCall(currentConversation.id, peerMember.userId);
+  }, [currentConversation, user]);
+
+  const handleAcceptCall = useCallback(() => {
+    void callServiceRef.current?.acceptCall();
+  }, []);
+
+  const handleHangupCall = useCallback(() => {
+    callServiceRef.current?.hangup();
+  }, []);
+
+  const handleToggleMute = useCallback(() => {
+    callServiceRef.current?.toggleMute();
+  }, []);
+
+  const callStatusLabel = useMemo(() => {
+    const { status, partnerName } = callSnapshot.state;
+    if (status === 'idle') {
+      return null;
+    }
+    if (status === 'calling') {
+      return `Calling ${partnerName ?? 'participant'}…`;
+    }
+    if (status === 'incoming') {
+      return `Incoming call from ${partnerName ?? 'participant'}`;
+    }
+    if (status === 'connecting') {
+      return 'Connecting voice call…';
+    }
+    if (status === 'connected') {
+      return `In call with ${partnerName ?? 'participant'}`;
+    }
+    return null;
+  }, [callSnapshot.state]);
+
+  const isCallConversation = callSnapshot.context?.conversationId === currentConversation?.id;
+  const isDirectConversation = Boolean(currentConversation && !currentConversation.isGroup);
+
   if (!isHydrated) {
     return <div className="flex h-full items-center justify-center">Loading…</div>;
   }
@@ -425,7 +375,7 @@ export default function ChatPage(): JSX.Element {
         </div>
       </aside>
       <main className="flex flex-1 flex-col">
-        <div className="flex items-center justify-between border-b border-slate-800 px-4 py-3">
+        <div className="flex flex-wrap items-center justify-between gap-4 border-b border-slate-800 px-4 py-3">
           <div>
             <h2 className="text-lg font-semibold text-slate-100">
               {currentConversation
@@ -436,21 +386,58 @@ export default function ChatPage(): JSX.Element {
                 : 'Select a conversation'}
             </h2>
             {currentTyping && <p className="text-xs text-slate-400">{currentTyping} is typing…</p>}
+            {callStatusLabel && (
+              <p className="mt-1 text-xs font-medium text-emerald-300">{callStatusLabel}</p>
+            )}
           </div>
-          {currentConversation && !currentConversation.isGroup && (
-            <button
-              type="button"
-              className="rounded-full bg-brand-500 px-4 py-2 text-sm font-semibold text-white hover:bg-brand-500/90"
-              onClick={() => {
-                const peerMember = currentConversation.members.find((member) => member.userId !== user.id);
-                if (peerMember) {
-                  void initiateCall(currentConversation.id, peerMember.userId, peerMember.user.username);
-                }
-              }}
-            >
-              Start voice call
-            </button>
-          )}
+          <div className="flex flex-wrap items-center gap-2">
+            {isDirectConversation && callSnapshot.state.status === 'idle' && (
+              <button
+                type="button"
+                onClick={handleStartCall}
+                disabled={!callServiceRef.current}
+                className="rounded-full bg-brand-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-brand-500/90 disabled:cursor-not-allowed disabled:bg-slate-700"
+              >
+                Start voice call
+              </button>
+            )}
+            {callSnapshot.state.status === 'incoming' && isCallConversation && (
+              <>
+                <button
+                  type="button"
+                  onClick={handleAcceptCall}
+                  className="rounded-full bg-emerald-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-emerald-500/90"
+                >
+                  Accept
+                </button>
+                <button
+                  type="button"
+                  onClick={handleHangupCall}
+                  className="rounded-full bg-red-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-red-500"
+                >
+                  Decline
+                </button>
+              </>
+            )}
+            {callSnapshot.state.status !== 'idle' && callSnapshot.state.status !== 'incoming' && isCallConversation && (
+              <>
+                <button
+                  type="button"
+                  onClick={handleHangupCall}
+                  className="rounded-full bg-red-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-red-500"
+                >
+                  Hang up
+                </button>
+                <button
+                  type="button"
+                  onClick={handleToggleMute}
+                  className="rounded-full bg-slate-800 px-4 py-2 text-sm font-semibold text-slate-100 transition hover:bg-slate-700"
+                >
+                  {callSnapshot.state.isMuted ? 'Unmute mic' : 'Mute mic'}
+                </button>
+              </>
+            )}
+          </div>
         </div>
         {selectedConversationId ? (
           <>
@@ -468,14 +455,7 @@ export default function ChatPage(): JSX.Element {
           </div>
         )}
       </main>
-      <CallModal
-        visible={callUi.visible}
-        isCaller={callUi.isCaller}
-        partnerName={callUi.partnerName}
-        localStream={localStream}
-        remoteStream={remoteStream}
-        onHangup={hangupCall}
-      />
+      <CallModal snapshot={callSnapshot} />
     </div>
   );
 }

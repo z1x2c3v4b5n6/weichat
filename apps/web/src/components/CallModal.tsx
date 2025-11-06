@@ -1,19 +1,17 @@
 'use client';
 
-import { useEffect, useRef } from 'react';
+import { useEffect, useMemo, useRef } from 'react';
+import type { CallSnapshot } from '@/services/call-service';
 
 interface CallModalProps {
-  visible: boolean;
-  isCaller: boolean;
-  partnerName: string;
-  localStream: MediaStream | null;
-  remoteStream: MediaStream | null;
-  onHangup: () => void;
+  snapshot: CallSnapshot;
 }
 
-export function CallModal({ visible, isCaller, partnerName, localStream, remoteStream, onHangup }: CallModalProps): JSX.Element | null {
+export function CallModal({ snapshot }: CallModalProps): JSX.Element | null {
   const localAudioRef = useRef<HTMLAudioElement | null>(null);
   const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
+
+  const { state, localStream, remoteStream } = snapshot;
 
   useEffect(() => {
     if (localAudioRef.current && localStream) {
@@ -27,28 +25,43 @@ export function CallModal({ visible, isCaller, partnerName, localStream, remoteS
     }
   }, [remoteStream]);
 
-  if (!visible) {
+  const statusLabel = useMemo(() => {
+    if (state.status === 'idle') {
+      return null;
+    }
+    if (state.status === 'calling') {
+      return `Calling ${state.partnerName ?? 'participant'}…`;
+    }
+    if (state.status === 'incoming') {
+      return `${state.partnerName ?? 'Someone'} is calling…`;
+    }
+    if (state.status === 'connecting') {
+      return 'Connecting audio…';
+    }
+    if (state.status === 'connected') {
+      return `In call with ${state.partnerName ?? 'participant'}`;
+    }
+    return null;
+  }, [state.partnerName, state.status]);
+
+  if (!statusLabel && !state.error) {
     return null;
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70">
-      <div className="w-full max-w-md rounded-2xl bg-slate-900 p-6 text-slate-100 shadow-xl">
-        <h2 className="text-xl font-semibold">Voice Call</h2>
-        <p className="mt-2 text-sm text-slate-400">
-          {isCaller ? 'Calling' : 'Incoming call from'} <span className="font-medium text-slate-100">{partnerName}</span>
-        </p>
-        <div className="mt-4 flex flex-col gap-2">
-          <audio ref={localAudioRef} autoPlay muted className="hidden" />
-          <audio ref={remoteAudioRef} autoPlay className="hidden" />
-          <button
-            type="button"
-            onClick={onHangup}
-            className="rounded-full bg-red-600 px-4 py-2 text-sm font-semibold text-white hover:bg-red-500"
-          >
-            Hang up
-          </button>
+    <div className="pointer-events-none fixed inset-x-0 bottom-6 z-40 flex justify-center px-4">
+      <div className="pointer-events-auto flex w-full max-w-lg flex-col rounded-xl border border-slate-700 bg-slate-900/95 p-4 text-sm text-slate-100 shadow-2xl backdrop-blur">
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            {statusLabel && <p className="font-medium text-slate-100">{statusLabel}</p>}
+            {state.error && <p className="text-xs text-red-400">{state.error}</p>}
+          </div>
+          <div className="text-xs uppercase tracking-wide text-slate-400">
+            {state.isMuted ? 'Muted' : 'Live audio'}
+          </div>
         </div>
+        <audio ref={localAudioRef} autoPlay muted className="hidden" />
+        <audio ref={remoteAudioRef} autoPlay className="hidden" />
       </div>
     </div>
   );
