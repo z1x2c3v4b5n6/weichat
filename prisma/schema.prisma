@@ -1,0 +1,72 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum MessageType {
+  TEXT
+  IMAGE
+  FILE
+  AUDIO
+}
+
+enum ConversationRole {
+  ADMIN
+  MEMBER
+}
+
+model User {
+  id            String               @id @default(uuid())
+  username      String               @unique
+  passwordHash  String
+  avatarUrl     String?
+  createdAt     DateTime             @default(now())
+  conversations ConversationMember[]
+  messages      Message[]
+  refreshTokens RefreshToken[]
+}
+
+model Conversation {
+  id        String                @id @default(uuid())
+  isGroup   Boolean               @default(false)
+  createdAt DateTime              @default(now())
+  members   ConversationMember[]
+  messages  Message[]
+}
+
+model ConversationMember {
+  id             String         @id @default(uuid())
+  conversation   Conversation   @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  conversationId String
+  user           User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId         String
+  role           ConversationRole
+
+  @@unique([conversationId, userId])
+}
+
+model Message {
+  id             String       @id @default(uuid())
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  conversationId String
+  sender         User         @relation(fields: [senderId], references: [id], onDelete: Cascade)
+  senderId       String
+  type           MessageType
+  content        String
+  fileUrl        String?
+  createdAt      DateTime     @default(now())
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId    String
+  token     String
+  expiresAt DateTime
+
+  @@index([token])
+}
