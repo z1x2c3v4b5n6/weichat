@@ -24,6 +24,13 @@ interface PaginatedMessagesResponse {
   nextCursor?: string;
 }
 
+interface PresignResponse {
+  objectKey: string;
+  putUrl: string;
+  getUrl: string;
+  headers: Record<string, string>;
+}
+
 export default function ChatPage(): JSX.Element {
   const router = useRouter();
   const { user, isHydrated, bootstrap, logout } = useAuthStore((state) => ({
@@ -39,6 +46,9 @@ export default function ChatPage(): JSX.Element {
   const [presence, setPresence] = useState<PresenceState>({});
   const [typingState, setTypingState] = useState<Record<string, boolean>>({});
   const [loadingMessages, setLoadingMessages] = useState(false);
+  const [unreadCounts, setUnreadCounts] = useState<Record<string, number>>({});
+  const [uploadProgress, setUploadProgress] = useState<number | null>(null);
+  const [uploadingFileName, setUploadingFileName] = useState<string | null>(null);
   const [callUi, setCallUi] = useState<{ visible: boolean; isCaller: boolean; partnerName: string }>({
     visible: false,
     isCaller: true,
@@ -51,6 +61,7 @@ export default function ChatPage(): JSX.Element {
   const peerRef = useRef<RTCPeerConnection | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
   const remoteStreamRef = useRef<MediaStream | null>(null);
+  const uploadAbortRef = useRef<AbortController | null>(null);
 
   useEffect(() => {
     bootstrap();
@@ -78,6 +89,15 @@ export default function ChatPage(): JSX.Element {
       lastMessage: conversation.messages[0]
     }));
     setConversations(mapped);
+    setUnreadCounts((prev) => {
+      const next: Record<string, number> = { ...prev };
+      mapped.forEach((conversation) => {
+        if (typeof next[conversation.id] !== 'number') {
+          next[conversation.id] = 0;
+        }
+      });
+      return next;
+    });
     if (mapped.length > 0 && !selectedConversationId) {
       setSelectedConversationId(mapped[0].id);
     }
@@ -121,11 +141,22 @@ export default function ChatPage(): JSX.Element {
             : conversation
         )
       );
-      if (message.conversationId === selectedConversationId) {
+      const isSelected = message.conversationId === selectedConversationId;
+      const isSelf = message.senderId === user?.id;
+      const isVisible = typeof document === 'undefined' ? true : document.visibilityState === 'visible';
+
+      if (isSelected) {
         setMessages((prev) => [...prev, message]);
       }
+
+      if (!isSelf && (!isSelected || !isVisible)) {
+        setUnreadCounts((prev) => ({
+          ...prev,
+          [message.conversationId]: (prev[message.conversationId] ?? 0) + 1
+        }));
+      }
     },
-    [selectedConversationId]
+    [selectedConversationId, user?.id]
   );
 
   const handlePresence = useCallback((payload: PresencePayload) => {
@@ -142,9 +173,15 @@ export default function ChatPage(): JSX.Element {
     [selectedConversationId]
   );
 
-  const handleReadAck = useCallback((payload: ReadAckPayload) => {
-    setTypingState((prev) => ({ ...prev, [payload.userId]: false }));
-  }, []);
+  const handleReadAck = useCallback(
+    (payload: ReadAckPayload) => {
+      setTypingState((prev) => ({ ...prev, [payload.userId]: false }));
+      if (payload.userId === user?.id) {
+        setUnreadCounts((prev) => ({ ...prev, [payload.conversationId]: payload.unreadCount ?? 0 }));
+      }
+    },
+    [user?.id]
+  );
 
   const { socket } = useChatSocket({
     onMessage: handleMessageCreated,
@@ -355,31 +392,83 @@ export default function ChatPage(): JSX.Element {
   );
 
   const requestPresign = useCallback(async (file: File) => {
-    const response = await api.get<{ objectKey: string; putUrl: string; getUrl: string }>(
-      '/storage/presign',
-      {
-        params: {
-          filename: file.name,
-          contentType: file.type
-        }
+    const response = await api.get<PresignResponse>('/storage/presign', {
+      params: {
+        filename: file.name,
+        contentType: file.type
       }
-    );
+    });
     return response.data;
   }, []);
 
   const handleUploadFile = useCallback(
     async (file: File) => {
+      if (uploadAbortRef.current) {
+        uploadAbortRef.current.abort();
+      }
       const presign = await requestPresign(file);
-      await fetch(presign.putUrl, {
-        method: 'PUT',
-        headers: { 'Content-Type': file.type },
-        body: file
+      const controller = new AbortController();
+      uploadAbortRef.current = controller;
+      setUploadingFileName(file.name);
+      setUploadProgress(0);
+
+      const reader = file.stream().getReader();
+      const total = file.size || 1;
+      let uploaded = 0;
+
+      const monitoredStream = new ReadableStream<Uint8Array>({
+        async pull(control) {
+          const { done, value } = await reader.read();
+          if (done) {
+            control.close();
+            return;
+          }
+          if (value) {
+            uploaded += value.length;
+            setUploadProgress(Math.min(uploaded / total, 1));
+            control.enqueue(value);
+          }
+        },
+        cancel(reason) {
+          return reader.cancel(reason);
+        }
       });
-      const type: MessageType = file.type.startsWith('audio') ? 'AUDIO' : file.type.startsWith('image') ? 'IMAGE' : 'FILE';
-      await sendMessage(type, file.name, presign.getUrl);
+
+      try {
+        const response = await fetch(presign.putUrl, {
+          method: 'PUT',
+          headers: presign.headers,
+          body: monitoredStream,
+          signal: controller.signal
+        });
+        if (!response.ok) {
+          throw new Error('Upload failed');
+        }
+        setUploadProgress(1);
+        await sendMessage('FILE', file.name, presign.getUrl);
+      } catch (error) {
+        if ((error as DOMException).name !== 'AbortError') {
+          console.error('Upload failed', error);
+        }
+      } finally {
+        if (uploadAbortRef.current === controller) {
+          uploadAbortRef.current = null;
+        }
+        setUploadProgress(null);
+        setUploadingFileName(null);
+      }
     },
     [requestPresign, sendMessage]
   );
+
+  const cancelUpload = useCallback(() => {
+    if (uploadAbortRef.current) {
+      uploadAbortRef.current.abort();
+      uploadAbortRef.current = null;
+    }
+    setUploadProgress(null);
+    setUploadingFileName(null);
+  }, []);
 
   const currentConversation = useMemo(() => {
     if (!selectedConversationId) {
@@ -400,6 +489,40 @@ export default function ChatPage(): JSX.Element {
     return member?.user.username ?? null;
   }, [typingState, currentConversation, selectedConversationId]);
 
+  const lastMessageId = useMemo(() => messages[messages.length - 1]?.id, [messages]);
+
+  const emitReadAck = useCallback(() => {
+    if (!socket || !selectedConversationId || !lastMessageId) {
+      return;
+    }
+    socket.emit('readAck', { conversationId: selectedConversationId, messageId: lastMessageId });
+    setUnreadCounts((prev) => ({ ...prev, [selectedConversationId]: 0 }));
+  }, [socket, selectedConversationId, lastMessageId]);
+
+  useEffect(() => {
+    if (typeof document === 'undefined') {
+      return;
+    }
+    const handler = () => {
+      if (document.visibilityState === 'visible') {
+        emitReadAck();
+      }
+    };
+    document.addEventListener('visibilitychange', handler);
+    return () => {
+      document.removeEventListener('visibilitychange', handler);
+    };
+  }, [emitReadAck]);
+
+  useEffect(() => {
+    emitReadAck();
+  }, [emitReadAck]);
+
+  const handleSelectConversation = useCallback((conversationId: string) => {
+    setSelectedConversationId(conversationId);
+    setUnreadCounts((prev) => ({ ...prev, [conversationId]: 0 }));
+  }, []);
+
   if (!isHydrated) {
     return <div className="flex h-full items-center justify-center">Loading…</div>;
   }
@@ -414,8 +537,9 @@ export default function ChatPage(): JSX.Element {
         <ConversationList
           conversations={conversations}
           selectedId={selectedConversationId}
-          onSelect={setSelectedConversationId}
+          onSelect={handleSelectConversation}
           presence={presence}
+          unreadCounts={unreadCounts}
         />
         <div className="border-t border-slate-800 p-4 text-sm text-slate-400">
           Logged in as <span className="font-medium text-slate-100">{user.username}</span>
@@ -460,6 +584,10 @@ export default function ChatPage(): JSX.Element {
               onSendText={handleSendText}
               onUploadFile={handleUploadFile}
               onTyping={handleTypingEmit}
+              isUploading={uploadProgress !== null}
+              uploadProgress={uploadProgress}
+              uploadingFileName={uploadingFileName}
+              onCancelUpload={cancelUpload}
             />
           </>
         ) : (

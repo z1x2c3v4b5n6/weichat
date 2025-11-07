@@ -7,6 +7,7 @@ export interface PresignResult {
   objectKey: string;
   putUrl: string;
   getUrl: string;
+  headers: Record<string, string>;
 }
 
 @Injectable()
@@ -45,11 +46,12 @@ export class StorageService {
     const extension = filename.includes('.') ? filename.split('.').pop() : undefined;
     const objectKey = `${uuid()}${extension ? `.${extension}` : ''}`;
 
-    const putUrl = await this.client.presignedPutObject(this.bucket, objectKey, 60 * 10, {
+    const headers: Record<string, string> = {
       'Content-Type': contentType
-    });
+    };
+    const putUrl = await this.client.presignedPutObject(this.bucket, objectKey, 60 * 10, headers);
     const getUrl = `${this.publicUrl}/${objectKey}`;
 
-    return { objectKey, putUrl, getUrl };
+    return { objectKey, putUrl, getUrl, headers };
   }
 }

@@ -83,4 +83,12 @@ export class ConversationsService {
       }
     });
   }
+
+  async getMemberIds(conversationId: string): Promise<string[]> {
+    const members = await this.prisma.conversationMember.findMany({
+      where: { conversationId },
+      select: { userId: true }
+    });
+    return members.map((member) => member.userId);
+  }
 }
