@@ -54,10 +54,15 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     private readonly conversationsService: ConversationsService
   ) {
     const subscriber = this.redisService.getSubscriber();
-    void subscriber.subscribe('presence', 'typing', 'readAck');
+    void subscriber.subscribe('typing', 'readAck');
+    void subscriber.psubscribe('presence:*');
     subscriber.on('message', (channel, message) => {
       const payload = JSON.parse(message) as Record<string, unknown>;
       this.server.emit(channel, payload);
+    });
+    subscriber.on('pmessage', (_pattern, channel, message) => {
+      const payload = JSON.parse(message) as Record<string, unknown>;
+      this.server.emit('presence', { ...(payload ?? {}), channel });
     });
   }
 
@@ -76,7 +81,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       await this.redisService.getClient().set(`presence:${payload.sub}`, 'online', 'EX', 30);
       await this.redisService
         .getPublisher()
-        .publish('presence', JSON.stringify({ userId: payload.sub, online: true }));
+        .publish(`presence:${payload.sub}`, JSON.stringify({ userId: payload.sub, online: true }));
     } catch (error) {
       client.disconnect();
     }
@@ -84,10 +89,10 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
 
   async handleDisconnect(client: SocketWithUser): Promise<void> {
     if (client.userId) {
-      await this.redisService.getClient().del(`presence:${client.userId}`);
+      await this.redisService.getClient().set(`presence:${client.userId}`, 'offline');
       await this.redisService
         .getPublisher()
-        .publish('presence', JSON.stringify({ userId: client.userId, online: false }));
+        .publish(`presence:${client.userId}`, JSON.stringify({ userId: client.userId, online: false }));
     }
   }
 
@@ -129,7 +134,19 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
       payload.content,
       payload.fileUrl
     );
-    this.server.to(payload.conversationId).emit('messageCreated', message);
+    const memberIds = await this.conversationsService.getMemberIds(payload.conversationId);
+    await Promise.all(
+      memberIds
+        .filter((memberId) => memberId !== userId)
+        .map((memberId) =>
+          this.redisService
+            .getClient()
+            .incr(`unread:${payload.conversationId}:${memberId}`)
+        )
+    );
+    memberIds.forEach((memberId) => {
+      this.server.to(memberId).emit('messageCreated', message);
+    });
   }
 
   @SubscribeMessage('typing')
@@ -150,8 +167,19 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   ): Promise<void> {
     const userId = this.getUserId(client);
     await this.redisService
+      .getClient()
+      .set(`unread:${payload.conversationId}:${userId}`, '0');
+    await this.redisService
       .getPublisher()
-      .publish('readAck', JSON.stringify({ conversationId: payload.conversationId, userId, lastReadMessageId: payload.messageId }));
+      .publish(
+        'readAck',
+        JSON.stringify({
+          conversationId: payload.conversationId,
+          userId,
+          lastReadMessageId: payload.messageId,
+          unreadCount: 0
+        })
+      );
   }
 
   @SubscribeMessage('presence')
@@ -160,7 +188,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     await this.redisService.getClient().set(`presence:${userId}`, 'online', 'EX', 30);
     await this.redisService
       .getPublisher()
-      .publish('presence', JSON.stringify({ userId, online: true }));
+      .publish(`presence:${userId}`, JSON.stringify({ userId, online: true }));
   }
 
   @SubscribeMessage('call:offer')

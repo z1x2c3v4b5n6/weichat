@@ -64,6 +64,7 @@ export interface PresencePayload {
   userId: string;
   online: boolean;
   lastSeen?: string;
+  channel?: string;
 }
 
 export interface TypingPayload {
@@ -76,4 +77,5 @@ export interface ReadAckPayload {
   conversationId: string;
   userId: string;
   lastReadMessageId: string;
+  unreadCount?: number;
 }

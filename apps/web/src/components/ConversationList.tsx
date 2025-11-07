@@ -9,9 +9,10 @@ interface ConversationListProps {
   selectedId: string | null;
   onSelect: (conversationId: string) => void;
   presence: PresenceState;
+  unreadCounts: Record<string, number>;
 }
 
-export function ConversationList({ conversations, selectedId, onSelect, presence }: ConversationListProps): JSX.Element {
+export function ConversationList({ conversations, selectedId, onSelect, presence, unreadCounts }: ConversationListProps): JSX.Element {
   const currentUser = useAuthStore((state) => state.user);
 
   return (
@@ -25,6 +26,8 @@ export function ConversationList({ conversations, selectedId, onSelect, presence
             : otherMembers[0]?.user.username ?? 'Unknown';
           const lastMessagePreview = conversation.lastMessage?.content ?? 'Start chatting';
           const isOnline = !conversation.isGroup && presence[otherMembers[0]?.userId ?? ''] === true;
+          const unread = unreadCounts[conversation.id] ?? 0;
+          const unreadLabel = unread > 99 ? '99+' : unread.toString();
 
           return (
             <button
@@ -38,7 +41,14 @@ export function ConversationList({ conversations, selectedId, onSelect, presence
             >
               <div className="flex items-center justify-between">
                 <span className="font-medium text-slate-100">{title}</span>
-                {isOnline && <span className="text-xs text-green-400">Online</span>}
+                <div className="flex items-center gap-2">
+                  {isOnline && <span className="text-xs text-green-400">Online</span>}
+                  {unread > 0 && (
+                    <span className="rounded-full bg-brand-500 px-2 py-0.5 text-xs font-semibold text-white">
+                      {unreadLabel}
+                    </span>
+                  )}
+                </div>
               </div>
               <span className="line-clamp-1 text-sm text-slate-400">{lastMessagePreview}</span>
             </button>
